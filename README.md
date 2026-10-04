@@ -18,7 +18,7 @@ A Python implementation of perceptual hash (pHash) generation that is fully comp
 uv pip install stash-phash
 
 # Or install from source
-git clone https://github.com/yourusername/stash-phash
+git clone https://github.com/hyper440/stash-phash
 cd stash-phash
 uv pip install -e .
 ```
@@ -111,14 +111,14 @@ This implementation matches Stash's phash algorithm exactly:
 ### For Videos
 
 1. Extract 25 frames (5x5 grid) from the video
-2. Skip first/last 5% of duration to avoid intros/outros
-3. Each frame is resized to 160x160 pixels
+2. Skip first/last 5% of duration to avoid intros/outros (the duration is rounded to 2 decimals, like Stash)
+3. Each frame is scaled to 160 pixels wide (`scale=160:-2`, height keeps the aspect ratio rounded to a multiple of 2)
 4. Frames are combined into a sprite image
 5. Apply perception hash to the sprite
 
 ### Perception Hash (pHash)
 
-1. Resize image to 64x64 using bilinear interpolation
+1. Resize image to 64x64 using bilinear interpolation, ported from `nfnt/resize` (not PIL's `BILINEAR`, which is not bit-identical)
 2. Convert to grayscale using luminosity formula: `0.299*R + 0.587*G + 0.114*B`
 3. Apply 2D Discrete Cosine Transform (DCT-II)
 4. Extract top-left 8x8 DCT coefficients (64 values)

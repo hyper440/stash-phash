@@ -19,6 +19,7 @@ The process:
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 import tempfile
 from collections.abc import Callable
@@ -58,6 +59,17 @@ def is_url(path: str) -> bool:
         return result.scheme in ("http", "https", "rtmp", "rtmps", "hls", "mms", "mmsh")
     except Exception:
         return False
+
+
+def stash_duration(duration: float) -> float:
+    """
+    Round a duration the way Stash does before using it for frame timing.
+
+    Stash stores ``FileDuration = math.Round(duration*100) / 100`` (pkg/ffmpeg/ffprobe.go)
+    and derives all 25 seek times from that value. Go's math.Round rounds half away
+    from zero, unlike Python's round().
+    """
+    return math.floor(duration * 100 + 0.5) / 100
 
 
 def get_video_duration(
@@ -113,9 +125,13 @@ def extract_frame(
     ffmpeg_path: str | None = None,
     timeout: int | None = None,
     output_path: str | None = None,
+    slow_seek: bool = False,
 ) -> Image.Image:
     """
     Extract a single frame from a video at the specified timestamp.
+
+    If the fast seek (``-ss`` before ``-i``) produces no frame, the extraction is retried
+    once with an accurate seek (``-ss`` after ``-i``), as Stash does.
 
     Args:
         video_source: Path to video file or URL to remote stream
@@ -124,6 +140,7 @@ def extract_frame(
         ffmpeg_path: Optional path to ffmpeg executable
         timeout: Timeout in seconds
         output_path: Optional output path (uses temp file if None)
+        slow_seek: Place -ss after -i (accurate seek). Normally only used as the fallback.
 
     Returns:
         PIL Image of the extracted frame
@@ -145,28 +162,24 @@ def extract_frame(
         cleanup = True
 
     try:
-        cmd = [
-            ffmpeg,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-ss",
-            str(timestamp),
-            "-i",
-            source_str,
-            "-frames:v",
-            "1",
-            "-vf",
-            f"scale={size}:-1",
-            "-update",
-            "1",
-            "-y",
-            tmp_path,
-        ]
+        seek = ["-ss", str(timestamp)]
+        cmd = [ffmpeg, "-hide_banner", "-loglevel", "error"]
+        cmd += ([] if slow_seek else seek) + ["-i", source_str] + (seek if slow_seek else [])
+        # scale=<w>:-2 (height rounded to a multiple of 2) is what Stash uses; -1 can give an
+        # odd height, which changes the sprite size and therefore the hash.
+        cmd += ["-frames:v", "1", "-vf", f"scale={size}:-2", "-update", "1", "-y", tmp_path]
 
-        subprocess.run(cmd, capture_output=True, check=True, timeout=timeout)
+        try:
+            subprocess.run(cmd, capture_output=True, check=True, timeout=timeout)
+            img = Image.open(tmp_path)
+        except (subprocess.CalledProcessError, OSError):
+            # Fast seek can fail or yield nothing (e.g. seeking near the end of the file).
+            if slow_seek:
+                raise
+            return extract_frame(
+                video_source, timestamp, size, ffmpeg_path, timeout, output_path, slow_seek=True
+            )
 
-        img = Image.open(tmp_path)
         img_copy = img.copy()
         img.close()
         return img_copy
@@ -256,7 +269,7 @@ def generate_sprite(
     is_remote = is_url(source_str)
 
     # Get video duration
-    duration = get_video_duration(video_source, ffprobe_path, timeout)
+    duration = stash_duration(get_video_duration(video_source, ffprobe_path, timeout))
 
     # Calculate frame timestamps (skip first/last 5%)
     offset = 0.05 * duration

@@ -4,7 +4,7 @@ Core perceptual hash algorithm implementation.
 This module implements the exact same perceptual hash algorithm used by Stash
 (via the goimagehash library). The algorithm:
 
-1. Resize image to 64x64 pixels using bilinear interpolation
+1. Resize image to 64x64 pixels (nfnt/resize Bilinear, as used by goimagehash)
 2. Convert to grayscale using luminosity formula: 0.299*R + 0.587*G + 0.114*B
 3. Apply 2D Discrete Cosine Transform (DCT-II)
 4. Extract top-left 8x8 block of DCT coefficients (64 values)
@@ -17,6 +17,7 @@ for duplicate detection via Hamming distance comparison.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -80,6 +81,78 @@ def dct_2d(pixels: NDArray[np.float64]) -> NDArray[np.float64]:
     return dct_2d_result
 
 
+def _resize_weights(out_size: int, scale: float) -> tuple[NDArray, NDArray, NDArray]:
+    """
+    Filter weights for one axis, ported from nfnt/resize ``createWeights8`` (Bilinear).
+
+    Returns (coeffs[out, taps], start[out], sum[out]). Weights are 8-bit fixed point
+    (``int16(kernel(x) * 256)``, truncated toward zero), exactly as in Go.
+    """
+    blur = 1.0
+    taps = 2 * int(max(math.ceil(blur * scale), 1))
+    factor = min(1.0 / (blur * scale), 1.0)
+
+    coeffs = np.zeros((out_size, taps), dtype=np.int32)
+    starts = np.zeros(out_size, dtype=np.int64)
+    for y in range(out_size):
+        interp = scale * (float(y) + 0.5) - 0.5
+        start = int(interp) - taps // 2 + 1
+        interp -= float(start)
+        starts[y] = start
+        for i in range(taps):
+            v = abs((interp - float(i)) * factor)
+            coeffs[y, i] = int((1.0 - v if v <= 1.0 else 0.0) * 256)
+    return coeffs, starts, coeffs.sum(axis=1)
+
+
+def _resize_pass(
+    data: NDArray[np.int32], out_size: int, scale: float, axis: int
+) -> NDArray[np.int32]:
+    """One separable pass along ``axis`` (0 = rows/vertical, 1 = columns/horizontal)."""
+    coeffs, starts, sums = _resize_weights(out_size, scale)
+    in_size = data.shape[axis]
+    # Edge handling matches Go: indices are clamped to [0, in_size - 1]
+    idx = np.clip(starts[:, None] + np.arange(coeffs.shape[1])[None, :], 0, in_size - 1)
+
+    if axis == 1:
+        data = np.swapaxes(data, 0, 1)  # (W, H, C): gather along the first axis
+    out = np.empty((out_size,) + data.shape[1:], dtype=np.int32)
+    # Process in chunks along the other axis to bound memory use
+    step = 128
+    for lo in range(0, data.shape[1], step):
+        block = data[:, lo : lo + step]  # (in, chunk, C)
+        gathered = block[idx]  # (out, taps, chunk, C)
+        acc = (gathered * coeffs[:, :, None, None]).sum(axis=1)  # (out, chunk, C)
+        # Go uses truncating integer division; values are never negative here
+        out[:, lo : lo + step] = np.minimum(acc // sums[:, None, None], 255)
+    return np.swapaxes(out, 0, 1) if axis == 1 else out
+
+
+def resize_bilinear_nfnt(rgb: NDArray[np.uint8], size: int = 64) -> NDArray[np.uint8]:
+    """
+    Resize an opaque RGB image to ``size`` x ``size`` exactly like nfnt/resize Bilinear.
+
+    goimagehash calls ``resize.Resize(64, 64, img, resize.Bilinear)``. That is not the same
+    as PIL's BILINEAR: nfnt uses 8-bit fixed-point weights, integer accumulation with
+    truncating division, rounds the intermediate (horizontal) result to 8 bits, and only
+    then runs the vertical pass. Even a +/-1 difference in a pixel can flip hash bits.
+
+    Args:
+        rgb: uint8 array of shape (height, width, 3)
+
+    Returns:
+        uint8 array of shape (size, size, 3)
+    """
+    height, width = rgb.shape[:2]
+    if width == size and height == size:
+        return rgb  # nfnt returns the input unchanged
+
+    data = rgb.astype(np.int32)
+    data = _resize_pass(data, size, width / size, axis=1)  # horizontal first
+    data = _resize_pass(data, size, height / size, axis=0)  # then vertical
+    return data.astype(np.uint8)
+
+
 def perception_hash(image: Image.Image) -> int:
     """
     Compute the perceptual hash (pHash) of an image.
@@ -104,9 +177,10 @@ def perception_hash(image: Image.Image) -> int:
         >>> phash = perception_hash(img)
         >>> print(f"{phash:016x}")  # Print as 16-char hex
     """
-    # Step 1: Resize to 64x64 using bilinear interpolation
-    # PIL's BILINEAR matches Go's resize.Bilinear
-    resized = image.resize((64, 64), Image.Resampling.BILINEAR)
+    # Step 1: Resize to 64x64 using nfnt/resize Bilinear (what goimagehash uses).
+    # PIL's BILINEAR is *not* bit-identical to it, so it is ported explicitly.
+    # Exact for opaque RGB(A) images such as the video sprite; alpha is ignored.
+    resized = Image.fromarray(resize_bilinear_nfnt(np.asarray(image.convert("RGB"))), "RGB")
 
     # Step 2: Convert to grayscale
     pixels = rgb_to_gray(resized)
